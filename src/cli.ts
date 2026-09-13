@@ -163,54 +163,41 @@ function mergeFiles(base: string, extra: string): string {
   return base.endsWith('\n') ? base + extra : `${base}\n${extra}`;
 }
 
-export async function runCli(argv: string[], io: Io = defaultIo): Promise<number> {
-  let config: Config;
-  try {
-    config = parseArgs(argv);
-  } catch (e) {
-    io.stderr(`${(e as Error).message}\n`);
-    return 1;
+function groupByFile(units: Unit[]): Map<string, Unit[]> {
+  const byFile = new Map<string, Unit[]>();
+  for (const u of units) {
+    if (!byFile.has(u.file)) byFile.set(u.file, []);
+    byFile.get(u.file)!.push(u);
   }
+  return byFile;
+}
 
-  const repoRoot = process.cwd();
-  let sourceRoot = config.sourceRoot;
-  if (!existsSync(sourceRoot)) {
-    io.stderr(`source root not found, falling back to '.'\n`);
-    sourceRoot = '.';
-  }
-
-  const warnings: string[] = [];
-  const warn = (msg: string) => warnings.push(msg);
-  const units = collectUnits(sourceRoot, warn);
-  if (units.length === 0) {
-    io.stderr('no functions found\n');
-    return 0;
-  }
-  const relUnits = units.map((u) => ({ ...u, file: relative(repoRoot, resolve(u.file)) || u.file }));
-
-  // scan mode: per-file rule counts, no tests, no manifest
-  if (config.scan) {
-    const perFile = new Map<string, number>();
-    const perRule = new Map<string, number>();
-    for (const u of relUnits) {
-      const text = readFileSync(join(repoRoot, u.file), 'utf8');
-      const sites = collectSites(text, u.file, [u]);
-      if (!perFile.has(u.file)) perFile.set(u.file, 0);
-      perFile.set(u.file, perFile.get(u.file)! + sites.length);
-      for (const s of sites) {
-        perRule.set(s.rule, (perRule.get(s.rule) ?? 0) + 1);
-      }
+function scanMode(relUnits: Unit[], warnings: string[], repoRoot: string, io: Io): number {
+  const perFile = new Map<string, number>();
+  const perRule = new Map<string, number>();
+  for (const u of relUnits) {
+    const text = readFileSync(join(repoRoot, u.file), 'utf8');
+    const sites = collectSites(text, u.file, [u]);
+    if (!perFile.has(u.file)) perFile.set(u.file, 0);
+    perFile.set(u.file, perFile.get(u.file)! + sites.length);
+    for (const s of sites) {
+      perRule.set(s.rule, (perRule.get(s.rule) ?? 0) + 1);
     }
-    for (const [file, count] of perFile) io.stdout(`${file}: ${count} sites\n`);
-    io.stdout(
-      `${RULE_NAMES.map((r) => `${r}: ${perRule.get(r) ?? 0}`).join('  ')}\n`,
-    );
-    for (const w of warnings) io.stderr(`${w}\n`);
-    return 0;
   }
+  for (const [file, count] of perFile) io.stdout(`${file}: ${count} sites\n`);
+  io.stdout(
+    `${RULE_NAMES.map((r) => `${r}: ${perRule.get(r) ?? 0}`).join('  ')}\n`,
+  );
+  for (const w of warnings) io.stderr(`${w}\n`);
+  return 0;
+}
 
-  // resolve test commands (explicit flag, else Nx inference per file) and the
-  // effective profile for the manifest fingerprint
+function resolveCommands(
+  config: Config,
+  relUnits: Unit[],
+  repoRoot: string,
+  io: Io,
+): Map<string, string> | null {
   const commands = new Map<string, string>();
   for (const u of relUnits) {
     if (commands.has(u.file)) continue;
@@ -221,7 +208,7 @@ export async function runCli(argv: string[], io: Io = defaultIo): Promise<number
     const inferred = inferTestCommand(repoRoot, u.file);
     if (!inferred) {
       io.stderr(`no test command and no Nx workspace found for ${u.file}\n`);
-      return 1;
+      return null;
     }
     commands.set(u.file, inferred);
   }
@@ -230,95 +217,96 @@ export async function runCli(argv: string[], io: Io = defaultIo): Promise<number
     for (const u of relUnits) {
       if (commands.get(u.file) !== first) {
         io.stderr(`inferred test commands are inconsistent across files: ${u.file}\n`);
-        return 1;
+        return null;
       }
     }
   }
-  const profile = testProfile(commands.get(relUnits[0].file)!);
+  return commands;
+}
 
-  // differential selection
+function loadManifests(relUnits: Unit[], repoRoot: string): Map<string, Manifest | null> {
   const manifests = new Map<string, Manifest | null>();
-  try {
-    for (const u of relUnits) {
-      if (!manifests.has(u.file)) {
-        const text = readFileSync(join(repoRoot, u.file), 'utf8');
-        manifests.set(u.file, parseManifest(text));
-      }
-    }
-  } catch (e) {
-    io.stderr(`${(e as Error).message}\n`);
-    return 1;
-  }
-  let selected: Unit[];
-  if (config.mutateAll) {
-    selected = relUnits;
-  } else {
-    selected = relUnits.filter((u) => {
-      const changed = selectChanged([u], manifests.get(u.file) ?? null, profile);
-      return changed.length > 0;
-    });
-  }
-  if (selected.length === 0) {
-    io.stderr('nothing to mutate\n');
-    return 0;
-  }
-
-  // group units by file once; mutation IDs are assigned sequentially per
-  // collectSites call, so sites are collected per file over ALL of the file's
-  // units to keep IDs stable across selection modes
-  const byFile = new Map<string, Unit[]>();
   for (const u of relUnits) {
-    if (!byFile.has(u.file)) byFile.set(u.file, []);
-    byFile.get(u.file)!.push(u);
+    if (!manifests.has(u.file)) {
+      const text = readFileSync(join(repoRoot, u.file), 'utf8');
+      manifests.set(u.file, parseManifest(text));
+    }
   }
-  const selectedFiles = new Set(selected.map((u) => u.file));
-  const selectedUnitsByFile = new Map<string, Unit[]>();
-  for (const u of selected) {
-    if (!selectedUnitsByFile.has(u.file)) selectedUnitsByFile.set(u.file, []);
-    selectedUnitsByFile.get(u.file)!.push(u);
-  }
+  return manifests;
+}
+
+function selectTargets(
+  config: Config,
+  relUnits: Unit[],
+  manifests: Map<string, Manifest | null>,
+  profile: string,
+): Unit[] {
+  if (config.mutateAll) return relUnits;
+  return relUnits.filter(
+    (u) => selectChanged([u], manifests.get(u.file) ?? null, profile).length > 0,
+  );
+}
+
+function collectSitesForTargets(
+  repoRoot: string,
+  byFile: Map<string, Unit[]>,
+  selectedFiles: Set<string>,
+): Map<string, MutationSite[]> {
   const sitesByFile = new Map<string, MutationSite[]>();
   for (const [file, fileUnits] of byFile) {
     if (!selectedFiles.has(file)) continue;
     const text = readFileSync(join(repoRoot, file), 'utf8');
     sitesByFile.set(file, collectSites(text, file, fileUnits));
   }
+  return sitesByFile;
+}
 
-  // coverage filter
-  let lcovFiles: LcovFile[] = [];
-  if (config.lcovPaths.length > 0) {
-    let merged: { files: LcovFile[]; missing: string[] };
-    try {
-      merged = mergeLcov(config.lcovPaths);
-    } catch (e) {
-      io.stderr(`${(e as Error).message}\n`);
-      return 1;
-    }
-    for (const m of merged.missing) warn(`lcov not found: ${m}`);
-    if (merged.files.length === 0) {
-      warn('no coverage records found in provided lcov files, skipping coverage filter');
-    } else if (coverageStale(merged.files, relUnits)) {
-      warn('coverage stale, run tests with coverage first');
-      lcovFiles = [];
-    } else {
-      lcovFiles = merged.files;
-    }
-  } else {
+function loadCoverageFilter(
+  config: Config,
+  relUnits: Unit[],
+  warn: (msg: string) => void,
+): LcovFile[] {
+  if (config.lcovPaths.length === 0) {
     warn('no coverage data provided, skipping coverage filter');
+    return [];
   }
-
-  // baseline
-  let baselineMs: number;
-  try {
-    baselineMs = await runBaseline(io, commands.get(selected[0].file)!, repoRoot);
-  } catch (e) {
-    if (e instanceof BaselineError) return 2;
-    io.stderr(`${(e as Error).message}\n`);
-    return 2;
+  const merged = mergeLcov(config.lcovPaths);
+  for (const m of merged.missing) warn(`lcov not found: ${m}`);
+  if (merged.files.length === 0) {
+    warn('no coverage records found in provided lcov files, skipping coverage filter');
+    return [];
   }
-  const timeoutMs = config.timeoutFactor * baselineMs;
+  if (coverageStale(merged.files, relUnits)) {
+    warn('coverage stale, run tests with coverage first');
+    return [];
+  }
+  return merged.files;
+}
 
-  // narrow-rerun filter
+interface MutationRun {
+  repoRoot: string;
+  config: Config;
+  byFile: Map<string, Unit[]>;
+  selectedFiles: Set<string>;
+  selectedUnitsByFile: Map<string, Unit[]>;
+  sitesByFile: Map<string, MutationSite[]>;
+  commands: Map<string, string>;
+  lcovFiles: LcovFile[];
+  timeoutMs: number;
+}
+
+async function runMutants(io: Io, run: MutationRun): Promise<MutantResult[] | null> {
+  const {
+    repoRoot,
+    config,
+    byFile,
+    selectedFiles,
+    selectedUnitsByFile,
+    sitesByFile,
+    commands,
+    lcovFiles,
+    timeoutMs,
+  } = run;
   const isNarrow = config.mutationIds.length > 0 || config.lines !== undefined;
   const inLines = (s: MutationSite) =>
     config.lines !== undefined && s.startLine >= config.lines.from && s.startLine <= config.lines.to;
@@ -360,24 +348,23 @@ export async function runCli(argv: string[], io: Io = defaultIo): Promise<number
         });
       }
     }
+    return results;
   } catch (e) {
     for (const w of workerByFile.values()) disposeWorker(w);
     io.stderr(`engine error: ${(e as Error).message}\n`);
-    return 4;
+    return null;
   } finally {
     for (const w of workerByFile.values()) disposeWorker(w);
   }
+}
 
-  // report
-  const report = config.format === 'json' ? renderJson(results) : renderText(results);
-  io.stdout(mergeFiles('', report));
-  for (const w of warnings) io.stderr(`${w}\n`);
-
-  const survivors = results.filter((r) => r.status === 'SURVIVED').length;
-  const notCovered = results.filter((r) => r.status === 'NOT-COVERED').length;
-  if (survivors > 0 || notCovered > 0) return 3;
-  if (isNarrow) return 0; // narrow reruns report but never certify (never write the manifest)
-
+function certify(
+  repoRoot: string,
+  byFile: Map<string, Unit[]>,
+  selectedFiles: Set<string>,
+  sitesByFile: Map<string, MutationSite[]>,
+  profile: string,
+): void {
   // full/differential clean run → certify each fully-killed file: replace its manifest
   // with per-function entries for ALL of the file's units (recomputed hashes are
   // identical for unchanged functions, so nothing is weakened)
@@ -400,6 +387,101 @@ export async function runCli(argv: string[], io: Io = defaultIo): Promise<number
     };
     writeFileSync(join(repoRoot, file), appendManifest(stripManifest(text), manifest));
   }
+}
+
+export async function runCli(argv: string[], io: Io = defaultIo): Promise<number> {
+  let config: Config;
+  try {
+    config = parseArgs(argv);
+  } catch (e) {
+    io.stderr(`${(e as Error).message}\n`);
+    return 1;
+  }
+
+  const repoRoot = process.cwd();
+  let sourceRoot = config.sourceRoot;
+  if (!existsSync(sourceRoot)) {
+    io.stderr(`source root not found, falling back to '.'\n`);
+    sourceRoot = '.';
+  }
+
+  const warnings: string[] = [];
+  const warn = (msg: string) => warnings.push(msg);
+  const units = collectUnits(sourceRoot, warn);
+  if (units.length === 0) {
+    io.stderr('no functions found\n');
+    return 0;
+  }
+  const relUnits = units.map((u) => ({ ...u, file: relative(repoRoot, resolve(u.file)) || u.file }));
+
+  if (config.scan) return scanMode(relUnits, warnings, repoRoot, io);
+
+  const commands = resolveCommands(config, relUnits, repoRoot, io);
+  if (!commands) return 1;
+  const profile = testProfile(commands.get(relUnits[0].file)!);
+
+  let manifests: Map<string, Manifest | null>;
+  try {
+    manifests = loadManifests(relUnits, repoRoot);
+  } catch (e) {
+    io.stderr(`${(e as Error).message}\n`);
+    return 1;
+  }
+  const selected = selectTargets(config, relUnits, manifests, profile);
+  if (selected.length === 0) {
+    io.stderr('nothing to mutate\n');
+    return 0;
+  }
+
+  const byFile = groupByFile(relUnits);
+  const selectedFiles = new Set(selected.map((u) => u.file));
+  const selectedUnitsByFile = groupByFile(selected);
+  const sitesByFile = collectSitesForTargets(repoRoot, byFile, selectedFiles);
+
+  let lcovFiles: LcovFile[];
+  try {
+    lcovFiles = loadCoverageFilter(config, relUnits, warn);
+  } catch (e) {
+    io.stderr(`${(e as Error).message}\n`);
+    return 1;
+  }
+
+  // baseline
+  let baselineMs: number;
+  try {
+    baselineMs = await runBaseline(io, commands.get(selected[0].file)!, repoRoot);
+  } catch (e) {
+    if (e instanceof BaselineError) return 2;
+    io.stderr(`${(e as Error).message}\n`);
+    return 2;
+  }
+  const timeoutMs = config.timeoutFactor * baselineMs;
+
+  const isNarrow = config.mutationIds.length > 0 || config.lines !== undefined;
+  const results = await runMutants(io, {
+    repoRoot,
+    config,
+    byFile,
+    selectedFiles,
+    selectedUnitsByFile,
+    sitesByFile,
+    commands,
+    lcovFiles,
+    timeoutMs,
+  });
+  if (results === null) return 4;
+
+  // report
+  const report = config.format === 'json' ? renderJson(results) : renderText(results);
+  io.stdout(mergeFiles('', report));
+  for (const w of warnings) io.stderr(`${w}\n`);
+
+  const survivors = results.filter((r) => r.status === 'SURVIVED').length;
+  const notCovered = results.filter((r) => r.status === 'NOT-COVERED').length;
+  if (survivors > 0 || notCovered > 0) return 3;
+  if (isNarrow) return 0; // narrow reruns report but never certify (never write the manifest)
+
+  certify(repoRoot, byFile, selectedFiles, sitesByFile, profile);
   return 0;
 }
 
