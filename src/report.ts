@@ -32,5 +32,14 @@ export function renderText(results: MutantResult[]): string {
 }
 
 export function renderJson(results: MutantResult[]): string {
-  return `${JSON.stringify(results, null, 2)}\n`;
+  const rows = results.map((r) => ({
+    id: r.id,
+    rule: r.rule,
+    file: r.file,
+    name: r.name,
+    line: r.startLine,
+    status: r.status,
+    seconds: r.seconds,
+  }));
+  return `${JSON.stringify(rows, null, 2)}\n`;
 }

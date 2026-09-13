@@ -31,9 +31,18 @@ describe('renderText', () => {
 });
 
 describe('renderJson', () => {
-  it('returns a JSON array of result objects, empty array for no results', () => {
-    const parsed = JSON.parse(renderJson(RESULTS)) as MutantResult[];
-    expect(parsed).toEqual(RESULTS);
+  it('serializes the spec shape {id, rule, file, name, line, status, seconds}', () => {
+    const parsed = JSON.parse(renderJson(RESULTS)) as Array<Record<string, unknown>>;
+    expect(parsed[0]).toEqual({
+      id: 'M001',
+      rule: 'boundary-gt',
+      file: 'src/pricing.ts',
+      name: 'discount',
+      line: 2,
+      status: 'KILLED',
+      seconds: 0.8,
+    });
+    expect(parsed.some((r) => 'startLine' in r)).toBe(false);
     expect(renderJson([])).toBe('[]\n');
   });
 });

@@ -31,7 +31,7 @@ npx github:schwammk/mutate4ts
 | `--scan` | count mutation sites per file and rule; no tests run | off |
 | `--lcov <path>` | LCOV file for coverage filtering; repeat to merge | none |
 | `--timeout-factor <n>` | mutant timeout = n × baseline test time | 10 |
-| `--format text\|json` | report format | text |
+| `--format text|json` | report format | text |
 
 ## Exit codes
 

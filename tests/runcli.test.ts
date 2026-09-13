@@ -150,6 +150,26 @@ describe('runCli', () => {
     expect(out.join('')).toContain('"status": "SURVIVED"');
   });
 
+  it('warns and proceeds unfiltered when the lcov file has no coverage records', async () => {
+    freshFixture();
+    writeFileSync(join(root, 'tests/fixtures/project/coverage/empty.info'), '');
+    const { io, err, out } = recordingIo();
+    const exit = await runCli(
+      [
+        '--source-root', 'tests/fixtures/project/src',
+        '--test-command', 'node run-tests.js',
+        '--lcov', 'tests/fixtures/project/coverage/empty.info',
+        '--mutate-all',
+        '--format', 'json',
+      ],
+      io,
+    );
+    expect(err.join('')).toContain('no coverage records found in provided lcov files, skipping coverage filter');
+    expect(exit).toBe(3);
+    expect(out.join('')).toContain('"status": "SURVIVED"');
+    expect(out.join('')).not.toContain('NOT-COVERED');
+  });
+
   it('scan mode prints per-file and per-rule counts, never runs tests, exits 0', async () => {
     const dir = freshFixture();
     const { io, out, err } = recordingIo();

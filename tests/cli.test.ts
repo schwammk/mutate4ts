@@ -63,6 +63,10 @@ describe('parseArgs', () => {
     expect(parseArgs(['--timeout-factor', '12']).timeoutFactor).toBe(12);
   });
 
+  it('rejects --timeout-factor 0 (must be >= 1)', () => {
+    expect(() => parseArgs(['--timeout-factor', '0'])).toThrow(CliError);
+  });
+
   it('rejects malformed --lines', () => {
     expect(() => parseArgs(['--lines', '42'])).toThrow(CliError);
     expect(() => parseArgs(['--lines', '60-42'])).toThrow(CliError);

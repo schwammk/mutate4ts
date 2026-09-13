@@ -64,8 +64,8 @@ function needValue(argv: string[], i: number, flag: string): string {
 
 function parseTimeoutFactor(raw: string): number {
   const trimmed = raw.trim();
-  if (trimmed === '' || !/^\d+$/.test(trimmed)) {
-    throw new CliError('--timeout-factor must be a non-negative integer');
+  if (trimmed === '' || !/^\d+$/.test(trimmed) || Number(trimmed) < 1) {
+    throw new CliError('--timeout-factor must be an integer >= 1');
   }
   return Number(trimmed);
 }
@@ -295,7 +295,9 @@ export async function runCli(argv: string[], io: Io = defaultIo): Promise<number
       return 1;
     }
     for (const m of merged.missing) warn(`lcov not found: ${m}`);
-    if (merged.files.length > 0 && coverageStale(merged.files, relUnits)) {
+    if (merged.files.length === 0) {
+      warn('no coverage records found in provided lcov files, skipping coverage filter');
+    } else if (coverageStale(merged.files, relUnits)) {
       warn('coverage stale, run tests with coverage first');
       lcovFiles = [];
     } else {
