@@ -1,0 +1,11 @@
+TN:
+SF:tests/fixtures/project/src/pricing.ts
+FN:1,discount
+FNDA:5,discount
+FN:8,tier
+FNDA:5,tier
+FN:18,clamp
+FNDA:2,clamp
+FN:28,rounded
+FNDA:0,rounded
+end_of_record

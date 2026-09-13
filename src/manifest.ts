@@ -66,6 +66,17 @@ export function appendManifest(sourceText: string, manifest: Manifest): string {
   return `${base}\n${buildManifestBlock(manifest)}`;
 }
 
+export function stripManifest(sourceText: string): string {
+  const markerAt = sourceText.lastIndexOf(MARKER);
+  if (markerAt === -1) return sourceText;
+  const blockStart = sourceText.lastIndexOf('/*', markerAt);
+  const blockEnd = sourceText.indexOf('*/', markerAt);
+  if (blockStart === -1 || blockEnd === -1) return sourceText;
+  let cut = sourceText.slice(0, blockStart);
+  while (cut.endsWith('\n')) cut = cut.slice(0, -1);
+  return `${cut}\n`;
+}
+
 export function selectChanged(units: Unit[], manifest: Manifest | null, currentTestProfile: string): Unit[] {
   if (!manifest) return units;
   if (manifest.ruleVersion !== RULE_VERSION || manifest.testProfile !== currentTestProfile) return units;
