@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { parseArgs, CliError } from '../src/cli.js';
+import { parseArgs, CliError, runCli, extendedHelp } from '../src/cli.js';
+import type { Io } from '../src/cli.js';
 
 describe('parseArgs', () => {
   it('applies documented defaults', () => {
@@ -85,5 +86,38 @@ describe('parseArgs', () => {
   it('rejects bad --format values', () => {
     expect(() => parseArgs(['--format', 'xml'])).toThrow(CliError);
     expect(parseArgs(['--format', 'text']).format).toBe('text');
+  });
+});
+
+describe('help', () => {
+  const recordingIo = (): { io: Io; out: string[]; err: string[] } => {
+    const out: string[] = [];
+    const err: string[] = [];
+    return { io: { stdout: (s) => out.push(s), stderr: (s) => err.push(s) }, out, err };
+  };
+
+  it('exposes extended help for known options', () => {
+    const text = extendedHelp(['--help', 'timeout-factor']);
+    expect(text).toBeTruthy();
+    expect(text!).toMatch(/baseline/i);
+    expect(text!.length).toBeGreaterThan(80);
+  });
+
+  it('falls back to null for unknown topics and plain --help', () => {
+    expect(extendedHelp(['--help', 'nope'])).toBeNull();
+    expect(extendedHelp(['--help'])).toBeNull();
+    expect(extendedHelp([])).toBeNull();
+  });
+
+  it('runCli prints extended help for a topic and exits 0', async () => {
+    const { io, out } = recordingIo();
+    expect(await runCli(['--help', 'mutation'], io)).toBe(0);
+    expect(out.join('')).toMatch(/M\d{3}/);
+  });
+
+  it('runCli prints generic help for plain --help and exits 0', async () => {
+    const { io, out } = recordingIo();
+    expect(await runCli(['--help'], io)).toBe(0);
+    expect(out.join('')).toMatch(/mutate4ts/);
   });
 });

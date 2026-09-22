@@ -3,6 +3,7 @@
 import { existsSync, readFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { join, dirname, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { Command, CommanderError } from 'commander';
 import { collectUnits, Unit, unitHash, RULE_VERSION } from './units.js';
 import { collectSites, MutationSite, RULE_NAMES } from './sites.js';
 import {
@@ -45,21 +46,88 @@ export interface Config {
   format: 'text' | 'json';
 }
 
-interface MutableConfig {
-  sourceRoot?: string;
-  testCommand?: string;
-  mutateAll: boolean;
-  mutationIds: string[];
-  lines?: { from: number; to: number };
-  scan: boolean;
-  lcovPaths: string[];
-  timeoutFactor?: number;
-  format?: 'text' | 'json';
-}
+const HELP = `mutate4ts — mutation testing for TypeScript
 
-function needValue(argv: string[], i: number, flag: string): string {
-  if (i + 1 >= argv.length) throw new CliError(`missing value for ${flag}`);
-  return argv[i + 1];
+Usage:
+  mutate4ts [options]
+  mutate4ts --scan               Count mutation sites per file and rule
+  mutate4ts --help               Show this help
+  mutate4ts --help <option>      Details for one option (e.g. --help timeout-factor)
+
+Options:
+  --source-root <dir>        Source directory to scan (default: src)
+  --test-command <cmd>       Test command executed per mutant (Nx inferred if omitted)
+  --mutate-all                Mutate all functions, ignore the manifest
+  --mutation <id>             Mutate only this site id, repeatable
+  --lines <from>-<to>         Mutate only sites starting within this range
+  --scan                      Print site counts and exit
+  --lcov <file>               LCOV coverage file, repeatable (coverage filter)
+  --timeout-factor <n>        Mutant timeout = n x baseline time (default 10)
+  --format <text|json>        Output format (default: text)
+`;
+
+export const EXTENDED_HELP: Record<string, string> = {
+  'source-root': `--source-root <dir>
+Directory scanned for functions to mutate, default "src".
+Falls back to the current directory when the given path
+does not exist. Each function is hashed so subsequent runs
+only re-test functions whose source changed (manifest
+differential mode).`,
+  'test-command': `--test-command <cmd>
+Test command executed for every surviving-candidate mutant,
+e.g. "npx vitest run tests/x.test.ts". When omitted, the
+command is inferred from the Nx workspace: the closest
+project.json ancestor of the mutated file determines the
+project and the command becomes
+"npx nx run-many -t test --projects=<name>". Mutants whose
+file lies outside any Nx project then abort with an error.`,
+  'mutate-all': `--mutate-all
+Mutate every function in the source root and ignore the
+manifest's changed-function selection. The clean baseline
+must still pass. After a fully killed full run the file's
+manifest is (re)certified.`,
+  mutation: `--mutation <id>
+Narrow rerun: mutate only the given site id (ids are shown
+in reports, e.g. "M017"), repeatable to rerun several.
+Useful to re-check a surviving mutant after a fix. Narrow
+reruns report results but never write the manifest.`,
+  lines: `--lines <from>-<to>
+Narrow rerun: mutate only mutation sites whose start line
+falls within [from, to], e.g. --lines 42-60. Like
+--mutation, narrow reruns never certify the manifest.`,
+  scan: `--scan
+Print per-file and per-rule mutation site counts and exit
+without running any tests. Use it to see the blast radius
+of the mutation rules before committing to a run.`,
+  lcov: `--lcov <file>
+LCOV coverage file used to pre-filter mutation targets,
+repeatable to merge runs. Functions without any covered
+line are skipped as NOT-COVERED instead of executing the
+test command — the cheapest way to shrink a run. Stale
+coverage (files changed after the coverage run) is ignored
+with a warning.`,
+  'timeout-factor': `--timeout-factor <n>
+Scales the per-mutant timeout: mutant timeout = n x the
+measured clean baseline duration, default 10. Higher
+values reduce false "timed out" verdicts on slow suites,
+at the cost of slower kill detection. Must be an
+integer >= 1.`,
+  format: `--format <text|json>
+Output format, default text. "json" emits one object per
+executed mutant: id, rule, file, name, startLine, status
+(KILLED | SURVIVED | TIMED-OUT | NOT-COVERED) and seconds.`,
+};
+
+export function extendedHelp(argv: string[]): string | null {
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] !== '--help' && argv[i] !== '-h') continue;
+    const next = argv[i + 1];
+    if (next !== undefined && !next.startsWith('-') && EXTENDED_HELP[next]) {
+      return EXTENDED_HELP[next];
+    }
+    return null;
+  }
+  return null;
 }
 
 function parseTimeoutFactor(raw: string): number {
@@ -85,61 +153,49 @@ function parseMutationId(raw: string): string {
 }
 
 export function parseArgs(argv: string[]): Config {
-  const c: MutableConfig = { mutateAll: false, mutationIds: [], scan: false, lcovPaths: [] };
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    switch (arg) {
-      case '--source-root':
-        c.sourceRoot = needValue(argv, i, arg);
-        i += 1;
-        break;
-      case '--test-command':
-        c.testCommand = needValue(argv, i, arg);
-        i += 1;
-        break;
-      case '--mutate-all':
-        c.mutateAll = true;
-        break;
-      case '--mutation':
-        c.mutationIds.push(parseMutationId(needValue(argv, i, arg)));
-        i += 1;
-        break;
-      case '--lines':
-        c.lines = parseLines(needValue(argv, i, arg));
-        i += 1;
-        break;
-      case '--scan':
-        c.scan = true;
-        break;
-      case '--lcov':
-        c.lcovPaths.push(needValue(argv, i, arg));
-        i += 1;
-        break;
-      case '--timeout-factor':
-        c.timeoutFactor = parseTimeoutFactor(needValue(argv, i, arg));
-        i += 1;
-        break;
-      case '--format': {
-        const value = needValue(argv, i, arg);
-        if (value !== 'text' && value !== 'json') throw new CliError(`--format must be text or json, got: ${value}`);
-        c.format = value;
-        i += 1;
-        break;
+  const parseFormat = (raw: string): 'text' | 'json' => {
+    if (raw !== 'text' && raw !== 'json') throw new CliError(`--format must be text or json, got: ${raw}`);
+    return raw as 'text' | 'json';
+  };
+  const program = new Command('mutate4ts')
+    .exitOverride()
+    .configureOutput({ writeErr: () => {} })
+    .option('--source-root <dir>', 'source directory to scan (default: src)')
+    .option('--test-command <cmd>', 'test command per mutant (Nx inferred if omitted)')
+    .option('--mutate-all', 'mutate all functions, ignore the manifest')
+    .option('--mutation <id>', 'site id to mutate, repeatable', (v: string, acc: string[]) => [...acc, parseMutationId(v)], [])
+    .option('--lines <range>', 'mutate sites within <from>-<to>', parseLines)
+    .option('--scan', 'print site counts and exit')
+    .option('--lcov <file>', 'LCOV coverage file, repeatable', (v: string, acc: string[]) => [...acc, v], [])
+    .option('--timeout-factor <n>', 'mutant timeout = n x baseline (default 10)', parseTimeoutFactor, 10)
+    .option('--format <format>', 'output format: text or json (default: text)', parseFormat, 'text');
+  try {
+    program.parse(argv, { from: 'user' });
+  } catch (err) {
+    if (err instanceof CliError) throw err;
+    if (err instanceof CommanderError) {
+      const quoted = err.message.match(/'([^']+)'/)?.[1];
+      if (err.code === 'commander.unknownOption') throw new CliError(`unknown option: ${quoted}`);
+      if (err.code === 'commander.unknownCommand') throw new CliError(`unknown option: ${quoted}`);
+      if (err.code === 'commander.missingMandatoryOptionValue' || err.code === 'commander.optionRequiresArgument') {
+        throw new CliError(`missing value for ${quoted}`);
       }
-      default:
-        throw new CliError(`unknown option: ${arg}`);
+      throw new CliError(err.message.replace(/^error: /, ''));
     }
+    throw err;
   }
+  if (program.args.length > 0) throw new CliError(`unknown option: ${program.args[0]}`);
+  const o = program.opts<Record<string, unknown>>();
   return {
-    sourceRoot: c.sourceRoot ?? 'src',
-    testCommand: c.testCommand,
-    mutateAll: c.mutateAll,
-    mutationIds: c.mutationIds,
-    lines: c.lines,
-    scan: c.scan,
-    lcovPaths: c.lcovPaths,
-    timeoutFactor: c.timeoutFactor ?? 10,
-    format: c.format ?? 'text',
+    sourceRoot: (o.sourceRoot as string) ?? 'src',
+    testCommand: o.testCommand as string | undefined,
+    mutateAll: o.mutateAll === true,
+    mutationIds: (o.mutation as string[]) ?? [],
+    lines: o.lines as { from: number; to: number } | undefined,
+    scan: o.scan === true,
+    lcovPaths: (o.lcov as string[]) ?? [],
+    timeoutFactor: o.timeoutFactor as number,
+    format: o.format as 'text' | 'json',
   };
 }
 
@@ -390,6 +446,15 @@ function certify(
 }
 
 export async function runCli(argv: string[], io: Io = defaultIo): Promise<number> {
+  const extended = extendedHelp(argv);
+  if (extended) {
+    io.stdout(extended + '\n');
+    return 0;
+  }
+  if (argv.includes('--help') || argv.includes('-h')) {
+    io.stdout(HELP + '\n');
+    return 0;
+  }
   let config: Config;
   try {
     config = parseArgs(argv);
